@@ -2,4 +2,7 @@
 
 members = [
     "db",
+    "server",
+    "store",
+    "raftstore"
 ]
