@@ -14,8 +14,8 @@ use regex::Regex;
 use crate::proposal::Proposal;
 
 struct Node {
-    // core: Arc<Mutex<CoreNode>>,
     thread: JoinHandle<()>,
+    proposals: Arc<Mutex<VecDeque<proposal::Proposal>>>,
 }
 
 struct CoreNode {
@@ -50,13 +50,20 @@ impl Node {
             let mut s = Snapshot::default();
             // Because we don't use the same configuration to initialize every node, so we use
             // a non-zero index to force new followers catch up logs by snapshot first, which will
-            // bring all nodes to the same initial state.
+            // // bring all nodes to the same initial state.
+            let storage = MemStorage::new();
             s.mut_metadata().index = 1;
             s.mut_metadata().term = 1;
             s.mut_metadata().mut_conf_state().nodes = vec![1];
-            let storage = MemStorage::new();
             storage.wl().apply_snapshot(s).unwrap();
-            raft_group = Some(RawNode::new(&cfg, storage).unwrap());
+            let r = RawNode::new(&cfg, storage).unwrap();
+
+            // let drain = slog_term::streamer().build().fuse();
+            // let logger = slog::Logger::root(drain, o!());
+            // r.with_logger(&logger);
+
+            raft_group = Some(r);
+            // raft_group = Some(RawNode::new(&cfg, storage).unwrap());
             // raft_group = Some(RawNode::new(&cfg, storage).unwrap());
         }
 
@@ -66,7 +73,7 @@ impl Node {
             raft_group,
             my_mailbox,
             mailboxes,
-            proposals,
+            proposals: Arc::clone(&proposals),
         };
 
         let thread = thread::spawn(move || {
@@ -76,11 +83,20 @@ impl Node {
 
         Node {
             thread,
+            proposals
         }
+    }
+
+    pub fn add_proposal(mut self, proposal: Proposal) {
     }
 }
 
 impl CoreNode {
+    pub fn add_proposal(mut self, proposal: Proposal) {
+        self.proposals.lock().unwrap().push_back(proposal);
+    }
+
+    // hqthao
     pub fn run(mut self) {
         let mut t = Instant::now();
         loop {
@@ -90,7 +106,9 @@ impl CoreNode {
             loop {
                 match self.my_mailbox.try_recv() {
                     Ok(msg) => self.step(msg),
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    },
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
@@ -114,6 +132,8 @@ impl CoreNode {
                     println!("process proposal ...");
                     proposal::propose(raft_group, p);
                 }
+            } else {
+                println!("fuck you bitch")
             }
 
             // Handle readies from the raft.
@@ -186,6 +206,7 @@ fn on_ready(
     proposals: &Mutex<VecDeque<Proposal>>,
 ) {
     if !raft_group.has_ready() {
+        println!("has not ready");
         return;
     }
     let store = raft_group.raft.raft_log.store.clone();
@@ -201,6 +222,7 @@ fn on_ready(
 
     // Apply the snapshot. It's necessary because in `RawNode::advance` we stabilize the snapshot.
     if *ready.snapshot() != Snapshot::default() {
+        println!("apply snapshot {}", raft_group.raft.id);
         let s = ready.snapshot().clone();
         if let Err(e) = store.wl().apply_snapshot(s) {
             eprintln!("apply snapshot fail: {:?}, need to retry or panic", e);
@@ -210,6 +232,7 @@ fn on_ready(
 
     // Send out the messages come from the node.
     for msg in ready.messages.drain(..) {
+        println!("send to {}: {:?}", msg.to, msg);
         let to = msg.to;
         if mailboxes[&to].send(msg).is_err() {
             eprintln!("send raft message to {} fail, let Raft retry it", to);
@@ -252,6 +275,7 @@ fn on_ready(
                 println!("on ready: i am leader");
                 // The leader should response to the clients, tell them if their proposals succeeded or not.
                 let proposal = proposals.lock().unwrap().pop_front().unwrap();
+                println!("fuck {:?}", proposal);
                 proposal.propose_success.send(true).unwrap();
             }
         }
@@ -301,7 +325,7 @@ pub(crate) fn execute() {
 
     // Put 100 key-value pairs.
     println!("We get a 5 nodes Raft cluster now, now propose 100 proposals");
-    (0..100u16)
+    (0..10)
         .filter(|i| {
             let (proposal, rx) = Proposal::normal(*i, "hello, world".to_owned());
             proposals.lock().unwrap().push_back(proposal);
@@ -315,6 +339,7 @@ pub(crate) fn execute() {
 }
 
 // Proposes some conf change for peers [2, 5].
+// hqthao
 fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>) {
     for i in 2..6u64 {
         let mut conf_change = ConfChange::default();
@@ -323,6 +348,7 @@ fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>) {
         loop {
             let (proposal, rx) = Proposal::conf_change(&conf_change);
             proposals.lock().unwrap().push_back(proposal);
+            // wait to finish proposal. actually other node does not need to work anything !!!
             if rx.recv().unwrap() {
                 break;
             }

@@ -8,6 +8,7 @@ struct Person {
 
 }
 
+#[derive(Debug)]
 pub struct Proposal {
     pub normal: Option<(u16, String)>,
     // key is an u16 integer, and value is a string.
@@ -46,6 +47,7 @@ impl Proposal {
 }
 
 pub fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
+    println!("debug proposal. leader {} process  {:?}", raft_group.raft.id, proposal);
     let last_index1 = raft_group.raft.raft_log.last_index() + 1;
     if let Some((ref key, ref value)) = proposal.normal {
         let data = format!("put {} {}", key, value).into_bytes();
@@ -61,9 +63,11 @@ pub fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
 
     let last_index2 = raft_group.raft.raft_log.last_index() + 1;
     if last_index2 == last_index1 {
+        println!("propose fail");
         // Propose failed, don't forget to respond to the client.
         proposal.propose_success.send(false).unwrap();
     } else {
+        println!("propose success");
         proposal.proposed = last_index1;
     }
 }
