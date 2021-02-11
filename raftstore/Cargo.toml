@@ -1,0 +1,17 @@
+[package]
+name = "raftstore"
+version = "0.1.0"
+authors = ["Huynh Quang Thao <huynhquangthao@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# raft="0.5.0"
+raft="0.6.0-alpha"
+regex = "1"
+protobuf = ">= 2.0, <= 2.14"
+slog = "2.7.0"
+slog-envlogger = { version = "2.1.0", optional = true }
+slog-stdlog = { version = "4", optional = true }
+slog-term = { version = "2.4.0", optional = true }
