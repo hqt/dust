@@ -2,8 +2,6 @@
 
 members = [
     "db",
-    "server",
-    "store",
     "raftstore",
     "grpc"
 ]
