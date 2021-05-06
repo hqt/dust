@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result};
 use rusqlite::NO_PARAMS;
+use std::rc::Rc;
 
 fn main() -> Result<()> {
     let conn = Connection::open("cats.db")?;
