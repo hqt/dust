@@ -1,5 +1,10 @@
 use rusqlite::{Connection, NO_PARAMS};
 
+const FK_CHECKS: &str = "PRAGMA foreign_keys";
+const FK_CHECKS_ENABLED: &str = "PRAGMA foreign_keys=ON";
+const FK_CHECKS_DISABLED: &str = "PRAGMA foreign_keys=OFF";
+
+// DB represents a wrapper for the Sqlite database instance
 pub struct DB {
     conn: Option<Connection>,
 }
@@ -28,13 +33,11 @@ impl DB {
     fn new(path: &str) -> Result<DB, String> {
         return match Connection::open(format_dsn(path, "")) {
             Ok(conn) => Ok(DB { conn: Some(conn) }),
-            Err(err) => {
-                eprintln!("{}", err);
-                Err(format!("cannot create db path {}", path))
-            }
+            Err(err) => Err(sql_err(err))
         };
     }
 
+    // closes the underlying database connection.
     pub fn close(mut self) -> Result<(), String> {
         if let Some(conn) = self.conn.take() {
             return match conn.close() {
@@ -55,23 +58,50 @@ impl DB {
     pub fn execute_string_stmt(&self, query: &str) -> Result<(), String> {
         return match self.get_conn().execute(query, NO_PARAMS) {
             Ok(_) => { Ok(()) }
-            Err(err) => {
-                eprintln!("execute error. {}", err);
-                Err(String::from("execute error"))
-            }
+            Err(err) => Err(sql_err(err))
         };
     }
 
+    // allows control of foreign key constraint checks.
+    pub fn enable_fk_constraints(&self, flag: bool) -> Result<(), String> {
+        let mut q = FK_CHECKS_ENABLED;
+        if !flag {
+            q = FK_CHECKS_DISABLED;
+        }
+
+        return match self.get_conn().execute(q, NO_PARAMS) {
+            Ok(_) => { Ok(()) }
+            Err(err) => Err(sql_err(err))
+        };
+    }
+
+    // returns whether FK constraints are set or not.
+    pub fn fk_constraints(&self) -> Result<bool, String> {
+        let res: rusqlite::Result<i64> = self.get_conn().query_row(
+            FK_CHECKS, NO_PARAMS, |r| r.get(0));
+        return match res {
+            Ok(check) => { Ok(check == 1) }
+            Err(err) => Err(sql_err(err))
+        };
+    }
+
+    // return the Connection object. panic if not available (e.g.: closed the database connection)
     fn get_conn(&self) -> &Connection {
         self.conn.as_ref().unwrap()
     }
 }
 
+// returns the fully-qualified datasource name.
 fn format_dsn(path: &str, dsn: &str) -> String {
     if dsn != "" {
         return format!("file:{}?{}", path, dsn);
     }
     return path.to_string();
+}
+
+fn sql_err(err: rusqlite::Error) -> String {
+    eprintln!("rusqlite exception -- {}", err.to_string());
+    err.to_string()
 }
 
 #[cfg(test)]
@@ -80,11 +110,14 @@ mod tests {
 
     #[test]
     fn test_constructor() {
-        assert!(DB::open("etc/sample.db").is_err());
         assert!(DB::open("sample.db").is_ok());
         assert!(DB::open_with_dsn("sample.db", "cache=shared&mode=memory").is_ok());
         assert!(DB::open_in_memory().is_ok());
         assert!(DB::open_in_memory_with_dsn("cache=shared&mode=memory").is_ok());
+
+        let res = DB::open("etc/sample.db");
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap(), "unable to open database file: etc/sample.db")
     }
 
     #[test]
@@ -93,13 +126,32 @@ mod tests {
         assert!(res.is_ok());
 
         let db = res.unwrap();
-        let res = db.execute_string_stmt("create table if not exists cat_colors (
-             id integer primary key,
-             name text not null unique
+        let res = db.execute_string_stmt("CREATE TABLE IF NOT EXISTS cat_colors (
+             id INTEGER PRIMARY KEY,
+             name TEXT NOT NULL UNIQUE
          )");
         assert!(res.is_ok());
 
         assert!(db.close().is_ok());
     }
-}
 
+    #[test]
+    fn test_fk_constraints() {
+        let db = DB::open_in_memory().unwrap();
+
+        // create table with FK constraint
+        assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, ref INTEGER REFERENCES foo(id))").is_ok());
+
+        // test disable FK constraint: be able to insert data
+        assert!(db.enable_fk_constraints(false).is_ok());
+        assert_eq!(db.fk_constraints().unwrap(), false);
+        assert!(db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 2)").is_ok());
+
+        // test enable FK constraint: cannot insert data
+        assert!(db.enable_fk_constraints(true).is_ok());
+        assert_eq!(db.fk_constraints().unwrap(), true);
+        let res = db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 3)");
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap(), "UNIQUE constraint failed: foo.id");
+    }
+}
