@@ -1,7 +1,8 @@
-use rusqlite::{Connection, NO_PARAMS, Transaction};
-use crate::sql::{Request, Response, Statement, Parameter};
-use crate::sql;
-use std::ops::Deref;
+use rusqlite::{Connection};
+use crate::sql::{Request, Response, Statement, Rows, Value, DataType};
+use std::ops::{Deref};
+use rusqlite::types::ValueRef;
+use std::str;
 
 const FK_CHECKS: &str = "PRAGMA foreign_keys";
 const FK_CHECKS_ENABLED: &str = "PRAGMA foreign_keys=ON";
@@ -56,6 +57,29 @@ impl DB {
         Err(String::from("db connection is already closed"))
     }
 
+    // allows control of foreign key constraint checks.
+    pub fn enable_fk_constraints(&self, flag: bool) -> Result<(), String> {
+        let mut q = FK_CHECKS_ENABLED;
+        if !flag {
+            q = FK_CHECKS_DISABLED;
+        }
+
+        return match self.get_conn().execute(q, []) {
+            Ok(_) => { Ok(()) }
+            Err(err) => Err(sql_err(err))
+        };
+    }
+
+    // returns whether FK constraints are set or not.
+    pub fn fk_constraints(&self) -> Result<bool, String> {
+        let res: rusqlite::Result<i64> = self.get_conn().query_row(
+            FK_CHECKS, [], |r| r.get(0));
+        return match res {
+            Ok(check) => { Ok(check == 1) }
+            Err(err) => Err(sql_err(err))
+        };
+    }
+
     // execute_string_stmt executes a single query that modifies the database.
     // This is primarily a convenience function.
     pub fn execute_string_stmt(&mut self, query: &str) -> Result<Vec<Response>, String> {
@@ -67,57 +91,17 @@ impl DB {
         return self.execute(&r);
     }
 
-    // allows control of foreign key constraint checks.
-    pub fn enable_fk_constraints(&self, flag: bool) -> Result<(), String> {
-        let mut q = FK_CHECKS_ENABLED;
-        if !flag {
-            q = FK_CHECKS_DISABLED;
-        }
-
-        return match self.get_conn().execute(q, NO_PARAMS) {
-            Ok(_) => { Ok(()) }
-            Err(err) => Err(sql_err(err))
-        };
-    }
-
-    // returns whether FK constraints are set or not.
-    pub fn fk_constraints(&self) -> Result<bool, String> {
-        let res: rusqlite::Result<i64> = self.get_conn().query_row(
-            FK_CHECKS, NO_PARAMS, |r| r.get(0));
-        return match res {
-            Ok(check) => { Ok(check == 1) }
-            Err(err) => Err(sql_err(err))
-        };
-    }
-
     // executes queries that modify the database.
     pub fn execute(&mut self, req: &Request) -> Result<Vec<Response>, String> {
-        let rollback = false;
-        let mut tx: Option<Transaction> = None;
-        // defer!({
-        //     if req.transaction {
-        //         if rollback {
-        //             tx.unwrap().rollback();
-        //         } else {
-        //            tx.unwrap().commit();
-        //         }
-        //     }
-        // });
+        return match self._execute(req) {
+            Ok(results) => { Ok(results) }
+            Err(err) => { Err(sql_err(err)) }
+        };
+    }
 
+    // internal implementation of execute that returns rusqlite::Error
+    pub fn _execute(&mut self, req: &Request) -> Result<Vec<Response>, rusqlite::Error> {
         let conn = self.get_mut_conn();
-
-        // if req.transaction {
-        //     tx = match conn.transaction() {
-        //         Ok(transaction) => Option::Some(transaction),
-        //         Err(err) => return Err(sql_err(err))
-        //     };
-        // }
-
-        // trait Executor {
-        //     fn insert_data<P>(&mut self, sql: &str, params: P) -> rusqlite::Result<usize>
-        //         where P: IntoIterator,
-        //     ;
-        // }
 
         let mut results = Vec::new();
         // Execute each statement.
@@ -127,18 +111,93 @@ impl DB {
                 continue;
             }
 
-            match conn.execute(sql, NO_PARAMS) {
-                Ok(rows) => {
-                    let res = Response {
-                        last_insert_id: 0,
-                        rows_affected: rows as i64,
-                        error: "".to_string(),
-                        time: 0.0,
-                    };
-                    results.push(res);
-                }
-                Err(err) => return Err(sql_err(err))
+            let rows_affected = conn.execute(sql, [])?;
+            let last_insert_id = conn.last_insert_rowid();
+
+            results.push(Response {
+                last_insert_id,
+                rows_affected: rows_affected as i64,
+            });
+        }
+
+        Ok(results)
+    }
+
+    // executes a single query that return rows, but don't modify database.
+    pub fn query_string_stmt(&self, query: &str) -> Result<Vec<Rows>, String> {
+        let stmt = Statement { sql: query.parse().unwrap(), parameters: Box::new([]) };
+        let r = Request {
+            transaction: false,
+            statements: Box::new([stmt]),
+        };
+
+        return self.query(&r);
+    }
+
+    // query executes queries that return rows, but don't modify the database.
+    pub fn query(&self, req: &Request) -> Result<Vec<Rows>, String> {
+        return match self._query(req) {
+            Ok(results) => { Ok(results) }
+            Err(err) => { Err(sql_err(err)) }
+        };
+    }
+
+    // internal implementation of query that returns rusqlite::Error
+    fn _query(&self, req: &Request) -> Result<Vec<Rows>, rusqlite::Error> {
+        let conn = self.get_conn();
+        let mut results = Vec::new();
+        for stmt in req.statements.deref() {
+            let sql = &stmt.sql;
+            if sql == "" {
+                continue;
             }
+
+            let mut columns = Vec::new();
+            let mut types = Vec::new();
+
+            // a closure (for capturing the columns variable)
+            // which maps from a single row under database to Vec<Value>: each index represents a single column of that row
+            let mapper = |row: &rusqlite::Row| -> rusqlite::Result<Vec<Value>> {
+                // get all column name and type once
+                if columns.is_empty() {
+                    columns = row.column_names().into_iter().map(|name| name.to_string()).collect();
+                    types = (0..row.column_count()).into_iter().map(|i| {
+                        return match row.get_ref_unwrap(i) {
+                            ValueRef::Null => { DataType::Null }
+                            ValueRef::Integer(_) => { DataType::Integer }
+                            ValueRef::Real(_) => { DataType::Real }
+                            ValueRef::Text(_) => { DataType::Text }
+                            ValueRef::Blob(_) => { DataType::Blob }
+                        };
+                    }).collect();
+                }
+
+                let values = (0..row.column_count())
+                    .into_iter()
+                    .map(|i| {
+                        return match row.get_ref_unwrap(i) {
+                            ValueRef::Null => { Value::Null }
+                            ValueRef::Integer(val) => { Value::Integer(val) }
+                            ValueRef::Real(val) => { Value::Real(val) }
+                            ValueRef::Text(val) => { Value::Text(str::from_utf8(val).unwrap().to_string()) }
+                            // TODO clone &[u8] array
+                            ValueRef::Blob(_) => { Value::Null }
+                        };
+                    })
+                    .collect();
+
+                Ok(values)
+            };
+
+            let mut prepare_stmt = conn.prepare(sql)?;
+            let rows = prepare_stmt.query_map([], mapper)?;
+            let values = rows.into_iter().map(|r| r.unwrap()).collect();
+
+            results.push(Rows {
+                columns,
+                types,
+                values,
+            });
         }
 
         Ok(results)
@@ -225,34 +284,177 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_string_stmt() {
+    fn test_execute_success() {
         let mut db = DB::open_in_memory().unwrap();
-
         assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
-        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#).is_ok());
+
+        let r = db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.execute_string_stmt(r#"UPDATE foo SET name="dana" WHERE ID=1"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
     }
 
     #[test]
-    fn test_multi_stmts() {
+    fn test_simple_string_stmt() {
         let mut db = DB::open_in_memory().unwrap();
 
         assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
 
-        let r = Request {
+        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#).is_ok());
+        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("aoife")"#).is_ok());
+
+        let r = db.query_string_stmt("SELECT * FROM foo");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.query_string_stmt(r#"SELECT * FROM foo WHERE name="aoife""#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[2,"aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.query_string_stmt(r#"SELECT * FROM foo WHERE name="unknown""#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":[],"types":[],"values":[]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.query_string_stmt(r#"SELECT * FROM foo ORDER BY name"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[2,"aoife"],[1,"fiona"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.query_string_stmt(r#"SELECT *,name FROM foo"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name","name"],"types":["integer","text","text"],"values":[[1,"fiona","fiona"],[2,"aoife","aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_simple_json_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt(r#"CREATE TABLE foo (c0 VARCHAR(36), c1 JSON, c2 NCHAR, c3 NVARCHAR, c4 CLOB)"#).is_ok());
+        assert!(db.execute_string_stmt(r#"INSERT INTO foo(c0, c1, c2, c3, c4) VALUES("fiona", '{"mittens": "foobar"}', "bob", "dana", "declan")"#).is_ok());
+
+        //  TODO rustqlite doesn't support returning other types than SQLite base types
+        // let r = db.query_string_stmt(r#"SELECT * FROM foo"#);
+        // assert!(r.is_ok());
+        // assert_eq!(
+        //     r#"[{"columns":["c0","c1","c2","c3","c4"],"types":["varchar(36)","json","nchar","nvarchar","clob"],"values":[["fiona","{\"mittens\": \"foobar\"}","bob","dana","declan"]]}]"#,
+        //     serde_json::to_string(&r.unwrap()).unwrap()
+        // );
+    }
+
+    #[test]
+    fn test_simple_join_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt(r#"CREATE TABLE names (id INTEGER NOT NULL PRIMARY KEY, name TEXT, ssn TEXT)"#).is_ok());
+        assert!(db.execute_string_stmt(r#"CREATE TABLE staff (id INTEGER NOT NULL PRIMARY KEY, employer TEXT, ssn TEXT)"#).is_ok());
+
+        let req = &Request {
             transaction: false,
             statements: Box::new([
-                Statement { sql: r#"INSERT INTO foo(name) VALUES("fiona")"#.to_string(), parameters: Box::new([]) },
-                Statement { sql: r#"INSERT INTO foo(name) VALUES("dana")"#.to_string(), parameters: Box::new([]) },
+                Statement { sql: r#"INSERT INTO "names" VALUES(1,'bob','123-45-678')"#.to_string(), parameters: Box::new([]) },
+                Statement { sql: r#"INSERT INTO "names" VALUES(2,'tom','111-22-333')"#.to_string(), parameters: Box::new([]) },
+                Statement { sql: r#"INSERT INTO "names" VALUES(3,'matt','222-22-333')"#.to_string(), parameters: Box::new([]) },
             ]),
         };
-        let res = db.execute(&r);
-        assert!(res.is_ok());
+        assert!(db.execute(req).is_ok());
+
+        assert!(db.execute_string_stmt(r#"INSERT INTO "staff" VALUES(1,'acme','222-22-333')"#).is_ok());
+
+        let r = db.query_string_stmt(r#"SELECT names.id,name,names.ssn,employer FROM names INNER JOIN staff ON staff.ssn = names.ssn"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name","ssn","employer"],"types":["integer","text","text","text"],"values":[[3,"matt","222-22-333","acme"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_single_concat_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt(r#"CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)"#).is_ok());
+        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#).is_ok());
+
+        let r = db.query_string_stmt(r#"SELECT id || "_bar", name FROM foo"#);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id || \"_bar\"","name"],"types":["text","text"],"values":[["1_bar","fiona"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_simple_multi_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
+
+        let req = &Request {
+            transaction: false,
+            statements: Box::new([
+                Statement {
+                    sql: r#"INSERT INTO foo(name) VALUES("fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(name) VALUES("dana")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+            ]),
+        };
+        let r = db.execute(req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let req = &Request {
+            transaction: false,
+            statements: Box::new([
+                Statement { sql: r#"SELECT * FROM foo"#.to_string(), parameters: Box::new([]) },
+                Statement { sql: r#"SELECT * FROM foo"#.to_string(), parameters: Box::new([]) },
+            ]),
+        };
+
+        let r = db.query(req);
+        assert!(r.is_ok());
+        assert_eq!(
+            concat!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"dana"]]},"#,
+            r#"{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"dana"]]}]"#
+            ),
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
     }
 
     #[test]
     fn test_single_multiline_stmt() {
         let mut db = DB::open_in_memory().unwrap();
-        let r = &Request {
+        let req = &Request {
             transaction: false,
             statements: Box::new([Statement {
                 sql: "
@@ -263,45 +465,25 @@ mod tests {
                 parameters: Box::new([]),
             }]),
         };
-        assert!(db.execute(r).is_ok());
+        assert!(db.execute(req).is_ok());
 
-        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#).is_ok());
-    }
-
-    #[test]
-    fn test_execute_json_stmts() {
-        let mut db = DB::open_in_memory().unwrap();
-
-        assert!(db.execute_string_stmt(r#"CREATE TABLE foo (c0 VARCHAR(36), c1 JSON, c2 NCHAR, c3 NVARCHAR, c4 CLOB)"#).is_ok());
-
-        assert!(db.execute_string_stmt(r#"INSERT INTO foo(c0, c1, c2, c3, c4) VALUES("fiona", '{"mittens": "foobar"}', "bob", "dana", "declan")"#).is_ok());
-    }
-
-    #[test]
-    fn test_join_stmts() {
-        let mut db = DB::open_in_memory().unwrap();
-
-        assert!(db.execute_string_stmt(r#"CREATE TABLE names (id INTEGER NOT NULL PRIMARY KEY, name TEXT, ssn TEXT)"#).is_ok());
-        assert!(db.execute_string_stmt(r#"CREATE TABLE staff (id INTEGER NOT NULL PRIMARY KEY, employer TEXT, ssn TEXT)"#).is_ok());
-
-        let r = &Request {
+        let req = &Request {
             transaction: false,
             statements: Box::new([
-                Statement { sql: r#"INSERT INTO "names" VALUES(1,'bob','123-45-678')"#.to_string(), parameters: Box::new([]) },
-                Statement { sql: r#"INSERT INTO "names" VALUES(2,'tom','111-22-333')"#.to_string(), parameters: Box::new([]) },
-                Statement { sql: r#"INSERT INTO "names" VALUES(3,'matt','222-22-333')"#.to_string(), parameters: Box::new([]) },
+                Statement {
+                    sql: r#"INSERT INTO foo(name) VALUES("fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(name) VALUES("dana")"#.to_string(),
+                    parameters: Box::new([]),
+                },
             ]),
         };
-        assert!(db.execute(r).is_ok());
-
-        assert!(db.execute_string_stmt(r#"INSERT INTO "staff" VALUES(1,'acme','222-22-333')"#).is_ok());
-    }
-
-    #[test]
-    fn test_single_concat_stmts() {
-        let mut db = DB::open_in_memory().unwrap();
-
-        assert!(db.execute_string_stmt(r#"CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)"#).is_ok());
-        assert!(db.execute_string_stmt(r#"INSERT INTO foo(name) VALUES("fiona")"#).is_ok());
+        let r = db.execute(req);
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
     }
 }

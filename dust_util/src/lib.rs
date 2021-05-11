@@ -16,21 +16,3 @@ impl<T: FnOnce()> Drop for DeferContext<T> {
         self.t.take().unwrap()()
     }
 }
-
-pub struct Conn {}
-
-impl Conn {
-    fn fuck(&self) {}
-}
-
-pub struct Transaction<'conn> {
-    conn: &'conn Conn,
-}
-
-impl Transaction<'_> {}
-
-pub fn test() {
-    let c = Transaction { conn: &Conn {} };
-    c.conn.fuck();
-    // c.fuck();
-}
