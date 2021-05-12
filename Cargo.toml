@@ -3,5 +3,6 @@
 members = [
     "db",
     "raftstore",
-    "grpc"
+    "grpc",
+    "dust_util"
 ]
