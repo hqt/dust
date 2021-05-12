@@ -1,5 +1,5 @@
-use rusqlite::{Connection};
-use crate::sql::{Request, Response, Statement, Rows, Value, DataType};
+use rusqlite::{Connection, ToSql};
+use crate::sql::{Request, Response, Statement, Rows, Value, DataType, Parameter};
 use std::ops::{Deref};
 use rusqlite::types::ValueRef;
 use std::str;
@@ -100,7 +100,7 @@ impl DB {
     }
 
     // internal implementation of execute that returns rusqlite::Error
-    pub fn _execute(&mut self, req: &Request) -> Result<Vec<Response>, rusqlite::Error> {
+    fn _execute(&mut self, req: &Request) -> Result<Vec<Response>, rusqlite::Error> {
         let conn = self.get_mut_conn();
 
         let mut results = Vec::new();
@@ -111,7 +111,8 @@ impl DB {
                 continue;
             }
 
-            let rows_affected = conn.execute(sql, [])?;
+            let params = &parameters(&stmt.parameters)[..];
+            let rows_affected = conn.execute(sql, params)?;
             let last_insert_id = conn.last_insert_rowid();
 
             results.push(Response {
@@ -189,8 +190,9 @@ impl DB {
                 Ok(values)
             };
 
+            let params = &parameters(&stmt.parameters)[..];
             let mut prepare_stmt = conn.prepare(sql)?;
-            let rows = prepare_stmt.query_map([], mapper)?;
+            let rows = prepare_stmt.query_map(params, mapper)?;
             let values = rows.into_iter().map(|r| r.unwrap()).collect();
 
             results.push(Rows {
@@ -220,6 +222,18 @@ fn format_dsn(path: &str, dsn: &str) -> String {
         return format!("file:{}?{}", path, dsn);
     }
     return path.to_string();
+}
+
+// convert parameters to the suitable format for rustqlite
+fn parameters(parameters: &Box<[Parameter]>) -> Vec<&dyn ToSql> {
+    let params: Vec<&dyn ToSql> = parameters.iter().map(|p| {
+        return match p {
+            Parameter::Integer(x) => { x as &dyn ToSql }
+            Parameter::Real(x) => { x as &dyn ToSql }
+            Parameter::Text(x) => { x as &dyn ToSql }
+        };
+    }).collect();
+    return params;
 }
 
 fn sql_err(err: rusqlite::Error) -> String {
@@ -269,13 +283,11 @@ mod tests {
         assert_eq!(res.err().unwrap(), "UNIQUE constraint failed: foo.id");
     }
 
-    // #[test]
-    // fn test_empty_stmt() {
-    //     let mut db = DB::open_in_memory().unwrap();
-    //     assert!(db.execute_string_stmt("").is_ok());
-    //     println!("FUCK: {}", db.execute_string_stmt(";").err().unwrap());
-    //     // assert!(db.execute_string_stmt(";").is_ok());
-    // }
+    #[test]
+    fn test_empty_stmt() {
+        let mut db = DB::open_in_memory().unwrap();
+        assert!(db.execute_string_stmt("").is_ok());
+    }
 
     #[test]
     fn test_execute_error() {
@@ -454,6 +466,7 @@ mod tests {
     #[test]
     fn test_single_multiline_stmt() {
         let mut db = DB::open_in_memory().unwrap();
+
         let req = &Request {
             transaction: false,
             statements: Box::new([Statement {
@@ -485,5 +498,105 @@ mod tests {
             r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1}]"#,
             serde_json::to_string(&r.unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn test_parameterized_all_type_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT, age INT, money FLOAT)").is_ok());
+
+        let req = Request {
+            transaction: false,
+            statements: Box::new([
+                Statement {
+                    sql: "INSERT INTO foo(name, age, money) VALUES(?, ?, ?)".to_string(),
+                    parameters: Box::new([
+                        Parameter::Text("fiona".to_string()),
+                        Parameter::Integer(20),
+                        Parameter::Real(100.75),
+                    ]),
+                }
+            ]),
+        };
+        assert!(db.execute(&req).is_ok());
+
+        let r = db.query_string_stmt("SELECT * FROM foo");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name","age","money"],"types":["integer","text","integer","real"],"values":[[1,"fiona",20,100.75]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_simple_parameterized_stmts() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.execute_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
+
+        let mut req = Request {
+            transaction: false,
+            statements: Box::new([
+                Statement {
+                    sql: "INSERT INTO foo(name) VALUES(?)".to_string(),
+                    parameters: Box::new([
+                        Parameter::Text("fiona".to_string()),
+                    ]),
+                }
+            ]),
+        };
+        assert!(db.execute(&req).is_ok());
+
+        req.statements[0].parameters[0] = Parameter::Text("aoife".to_string());
+        assert!(db.execute(&req).is_ok());
+
+        let r = db.query_string_stmt("SELECT * FROM foo");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        req.statements[0].sql = "SELECT * FROM foo WHERE name=?".to_string();
+        req.statements[0].parameters[0] = Parameter::Text("aoife".to_string());
+        let r = db.query(&req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[2,"aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        req.statements[0].parameters[0] = Parameter::Text("fiona".to_string());
+        let r = db.query(&req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let req = Request {
+            transaction: false,
+            statements: Box::new([
+                Statement {
+                    sql: "SELECT * FROM foo WHERE NAME=?".to_string(),
+                    parameters: Box::new([
+                        Parameter::Text("fiona".to_string()),
+                    ]),
+                },
+                Statement {
+                    sql: "SELECT * FROM foo WHERE NAME=?".to_string(),
+                    parameters: Box::new([
+                        Parameter::Text("aoife".to_string()),
+                    ]),
+                },
+            ]),
+        };
+        let r = db.query(&req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]},{"columns":["id","name"],"types":["integer","text"],"values":[[2,"aoife"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        )
     }
 }

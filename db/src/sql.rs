@@ -10,7 +10,11 @@ pub struct Statement {
     pub parameters: Box<[Parameter]>,
 }
 
-pub struct Parameter {}
+pub enum Parameter {
+    Integer(i64),
+    Real(f64),
+    Text(String),
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 // Response represents the outcome of an operation that changes rows.
@@ -44,7 +48,7 @@ pub enum Value<'a> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all="lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum DataType {
     Null,
     Integer,
