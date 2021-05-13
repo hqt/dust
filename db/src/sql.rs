@@ -19,8 +19,12 @@ pub enum Parameter {
 #[derive(Debug, Deserialize, Serialize)]
 // Response represents the outcome of an operation that changes rows.
 pub struct Response {
+    #[serde(skip_serializing_if = "is_zero")]
     pub last_insert_id: i64,
+    #[serde(skip_serializing_if = "is_zero")]
     pub rows_affected: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -55,4 +59,8 @@ pub enum DataType {
     Real,
     Text,
     Blob,
+}
+
+fn is_zero(num: &i64) -> bool {
+    *num == 0
 }
