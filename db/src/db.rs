@@ -1,4 +1,4 @@
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, ToSql, Transaction};
 use crate::sql::{Request, Response, Statement, Rows, Value, DataType, Parameter};
 use std::ops::{Deref};
 use rusqlite::types::ValueRef;
@@ -7,6 +7,65 @@ use std::str;
 const FK_CHECKS: &str = "PRAGMA foreign_keys";
 const FK_CHECKS_ENABLED: &str = "PRAGMA foreign_keys=ON";
 const FK_CHECKS_DISABLED: &str = "PRAGMA foreign_keys=OFF";
+
+// represents a connection that be naked or a transaction
+enum WrappedConnection<'a> {
+    Transaction {
+        transaction: Transaction<'a>
+    },
+    Naked {
+        conn: &'a mut Connection
+    },
+}
+
+impl WrappedConnection<'_> {
+    fn new(conn: &mut Connection, is_tx: bool) -> Result<WrappedConnection, rusqlite::Error> {
+        let wrapped = match is_tx {
+            false => {
+                WrappedConnection::Naked { conn }
+            }
+            true => {
+                let trans = conn.transaction()?;
+                WrappedConnection::Transaction {
+                    transaction: trans,
+                }
+            }
+        };
+        Ok(wrapped)
+    }
+
+    fn commit(self) -> Result<(), rusqlite::Error> {
+        match self {
+            WrappedConnection::Naked { conn: _connection } =>
+                Ok(()),
+            WrappedConnection::Transaction { transaction } =>
+                transaction.commit()
+        }
+    }
+
+    fn rollback(self) -> Result<(), rusqlite::Error> {
+        match self {
+            WrappedConnection::Naked { conn: _connection } =>
+                Ok(()),
+            WrappedConnection::Transaction { transaction } =>
+                transaction.rollback()
+        }
+    }
+}
+
+// implement trait Deref to allow WrappedConnection acted as a connection either in Connection or Transaction mode
+impl<'a> Deref for WrappedConnection<'a> {
+    type Target = Connection;
+    #[inline]
+    fn deref(&self) -> &Connection {
+        match self {
+            WrappedConnection::Transaction { transaction } =>
+                transaction,
+            WrappedConnection::Naked { conn: connection } =>
+                connection,
+        }
+    }
+}
 
 // DB represents a wrapper for the Sqlite database instance
 pub struct DB {
@@ -101,10 +160,12 @@ impl DB {
 
     // internal implementation of execute that returns rusqlite::Error
     fn _execute(&mut self, req: &Request) -> Result<Vec<Response>, rusqlite::Error> {
-        let conn = self.get_mut_conn();
+        let is_tx = req.transaction;
+        let conn = WrappedConnection::new(self.get_mut_conn(), is_tx)?;
 
+        let mut rollback = false;
         let mut results = Vec::new();
-        // Execute each statement.
+
         for stmt in req.statements.deref() {
             let sql = &stmt.sql;
             if sql == "" {
@@ -112,13 +173,36 @@ impl DB {
             }
 
             let params = &parameters(&stmt.parameters)[..];
-            let rows_affected = conn.execute(sql, params)?;
-            let last_insert_id = conn.last_insert_rowid();
+            let rows_affected = conn.execute(sql, params);
 
+            if rows_affected.is_err() {
+                results.push(Response {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                    error: rows_affected.err().unwrap().to_string(),
+                });
+                if is_tx {
+                    rollback = true;
+                    // in transaction, not allow to execute more statements
+                    break;
+                }
+                continue;
+            }
+
+            let last_insert_id = conn.last_insert_rowid();
             results.push(Response {
                 last_insert_id,
-                rows_affected: rows_affected as i64,
+                rows_affected: rows_affected.unwrap() as i64,
+                error: "".to_string(),
             });
+        }
+
+        if is_tx {
+            if rollback {
+                conn.rollback()?;
+            } else {
+                conn.commit()?;
+            }
         }
 
         Ok(results)
@@ -273,26 +357,28 @@ mod tests {
         // test disable FK constraint: be able to insert data
         assert!(db.enable_fk_constraints(false).is_ok());
         assert_eq!(db.fk_constraints().unwrap(), false);
-        assert!(db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 2)").is_ok());
+        let r = db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 2)");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
 
         // test enable FK constraint: cannot insert data
         assert!(db.enable_fk_constraints(true).is_ok());
         assert_eq!(db.fk_constraints().unwrap(), true);
-        let res = db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 3)");
-        assert!(res.is_err());
-        assert_eq!(res.err().unwrap(), "UNIQUE constraint failed: foo.id");
+        let r = db.execute_string_stmt("INSERT INTO foo(id, ref) VALUES(1, 3)");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"error":"UNIQUE constraint failed: foo.id"}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
     }
 
     #[test]
     fn test_empty_stmt() {
         let mut db = DB::open_in_memory().unwrap();
         assert!(db.execute_string_stmt("").is_ok());
-    }
-
-    #[test]
-    fn test_execute_error() {
-        let mut db = DB::open_in_memory().unwrap();
-        assert!(db.execute_string_stmt("exception query").is_err());
     }
 
     #[test]
@@ -598,5 +684,144 @@ mod tests {
             r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]},{"columns":["id","name"],"types":["integer","text"],"values":[[2,"aoife"]]}]"#,
             serde_json::to_string(&r.unwrap()).unwrap()
         )
+    }
+
+    #[test]
+    fn test_simple_transaction() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.query_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
+
+        let req = &Request {
+            transaction: true,
+            statements: Box::new([
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(2, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(3, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(4, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                }
+            ]),
+        };
+
+        let r = db.execute(req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1},{"last_insert_id":3,"rows_affected":1},{"last_insert_id":4,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let r = db.query_string_stmt("SELECT * FROM foo");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"fiona"],[3,"fiona"],[4,"fiona"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_partial_fail_transaction() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.query_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
+
+        let req = &Request {
+            transaction: true,
+            statements: Box::new([
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(2, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(4, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                }
+            ]),
+        };
+        let r = db.execute(req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1},{"error":"UNIQUE constraint failed: foo.id"}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+
+        let r = db.query_string_stmt("SELECT * FROM FOO");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":[],"types":[],"values":[]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+
+        let req = &Request {
+            transaction: true,
+            statements: Box::new([
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                }
+            ]),
+        };
+        assert!(db.execute(req).is_ok());
+
+        let r = db.query_string_stmt("SELECT * FROM FOO");
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_partial_fail_without_transaction() {
+        let mut db = DB::open_in_memory().unwrap();
+
+        assert!(db.query_string_stmt("CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)").is_ok());
+
+        let req = &Request {
+            transaction: false,
+            statements: Box::new([
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(2, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(1, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                },
+                Statement {
+                    sql: r#"INSERT INTO foo(id, name) VALUES(4, "fiona")"#.to_string(),
+                    parameters: Box::new([]),
+                }
+            ]),
+        };
+        let r = db.execute(req);
+        assert!(r.is_ok());
+        assert_eq!(
+            r#"[{"last_insert_id":1,"rows_affected":1},{"last_insert_id":2,"rows_affected":1},{"error":"UNIQUE constraint failed: foo.id"},{"last_insert_id":4,"rows_affected":1}]"#,
+            serde_json::to_string(&r.unwrap()).unwrap()
+        );
     }
 }
