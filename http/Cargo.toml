@@ -1,0 +1,15 @@
+[package]
+name = "http"
+version = "0.1.0"
+authors = ["Huynh Quang Thao <huynhquangthao@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hyper = { version = "0.14.6", features = ["full"] }
+tokio = { version = "1.5.0", features = ["full", "test-util"] }
+tokio-test = "0.4.1"
+futures = "0.3.15"
+futures-util = { version = "0.3", default-features = false }
+rand = "0.8"

@@ -4,5 +4,6 @@ members = [
     "db",
     "raftstore",
     "grpc",
+    "http",
     "dust_util"
 ]
