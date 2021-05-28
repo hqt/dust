@@ -1,5 +1,5 @@
 [package]
-name = "db"
+name = "store"
 version = "0.1.0"
 authors = ["Huynh Quang Thao <huynhquangthao@gmail.com>"]
 edition = "2018"
@@ -7,8 +7,5 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rusqlite = { version = "0.25.3", features = ["serde_json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dust_util = { path = "../dust_util" }
+thiserror = "1.0"
 command = { path = "../command" }
