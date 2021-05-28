@@ -2,7 +2,10 @@
 
 members = [
     "db",
-    "raftstore",
+    "command",
+    "dust_util",
     "grpc",
-    "dust_util"
+    "http",
+    "raftstore",
+    "store"
 ]

@@ -1,8 +1,8 @@
 use rusqlite::{Connection, ToSql, Transaction};
-use crate::sql::{Request, Response, Statement, Rows, Value, DataType, Parameter};
 use std::ops::{Deref};
 use rusqlite::types::ValueRef;
 use std::str;
+use command::{Value, Rows, Request, Response, DataType, Parameter, Statement};
 
 const FK_CHECKS: &str = "PRAGMA foreign_keys";
 const FK_CHECKS_ENABLED: &str = "PRAGMA foreign_keys=ON";

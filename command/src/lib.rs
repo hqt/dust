@@ -1,15 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExecuteRequest {
+    pub request: Request,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct QueryRequest {
+    pub request: Request,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
     pub transaction: bool,
     pub statements: Box<[Statement]>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Statement {
     pub sql: String,
     pub parameters: Box<[Parameter]>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
 pub enum Parameter {
     Integer(i64),
     Real(f64),
