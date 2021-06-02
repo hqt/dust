@@ -91,7 +91,7 @@ impl<T> Service<T> where T: DbStore {
             .with_graceful_shutdown(async move {
                 let _ = rx.await;
             })
-            .map_err(|e| eprintln!("status server error {:?}", e));
+            .map_err(|e| eprintln!("http server error {:?}", e));
         self.thread_pool.spawn(graceful);
         eprintln!("started service ...");
     }

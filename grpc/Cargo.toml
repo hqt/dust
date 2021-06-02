@@ -7,17 +7,11 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "0.3"
-prost = "0.6"
-tokio = { version = "0.2", features = ["macros"] }
+tonic = "0.4.2"
+prost = "0.7"
+tokio = { version = "1.5.0", features = ["full", "test-util"] }
+tokio-test = "0.4.1"
+rand = "0.8.3"
 
 [build-dependencies]
-tonic-build = "0.3"
-
-[[bin]] # Bin to run the HelloWorld gRPC server
-name = "helloworld-server"
-path = "src/server.rs"
-
-[[bin]] # Bin to run the HelloWorld gRPC client
-name = "helloworld-client"
-path = "src/client.rs"
+tonic-build = "0.4.2"
